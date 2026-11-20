@@ -1,0 +1,6 @@
+node_modules/
+src-tauri/target/
+src-tauri/gen/
+*.log
+# local data snapshots for UI preview: contain your own file names, never commit
+mock/
