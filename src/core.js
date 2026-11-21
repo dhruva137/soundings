@@ -95,9 +95,10 @@ export function category(path) {
   return 'Other';
 }
 
-// ---- review tray: everything the user marked, from any page ----
+// ---- shortlist: everything the user marked, from any page (kept on this PC only) ----
+const SHORTLIST_KEY = 'soundings.shortlist';
 export const review = {
-  items: new Map(), // path -> {size, label, kind}
+  items: new Map((() => { try { return JSON.parse(localStorage.getItem(SHORTLIST_KEY) || '[]'); } catch { return []; } })()), // path -> {size, label, kind}
   listeners: new Set(),
   add(path, sz, label, kind = 'file') { this.items.set(path, { size: sz, label: label || base(path), kind }); this.emit(); },
   remove(path) { this.items.delete(path); this.emit(); },
@@ -105,7 +106,10 @@ export const review = {
   has(path) { return this.items.has(path); },
   clear() { this.items.clear(); this.emit(); },
   total() { let t = 0; for (const v of this.items.values()) t += v.size || 0; return t; },
-  emit() { for (const f of this.listeners) f(); },
+  emit() {
+    try { localStorage.setItem(SHORTLIST_KEY, JSON.stringify([...this.items])); } catch {}
+    for (const f of this.listeners) f();
+  },
 };
 
 // ---- dialogs & toasts ----

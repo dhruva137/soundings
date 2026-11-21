@@ -9,7 +9,7 @@ export default function storage(el, opts) {
   let burst = null;
   const unsub = [];
 
-  el.innerHTML = `<div class="page-head"><div><h1>Storage</h1><div class="sub" id="st-sub">Reads file sizes only. Nothing is removed unless you review it.</div></div>
+  el.innerHTML = `<div class="page-head"><div><h1>Storage</h1><div class="sub" id="st-sub">Reads names, sizes and dates. Soundings never deletes anything.</div></div>
     <div class="actions"><select id="st-root" title="What to map"></select><button class="btn accent" id="st-scan">${icon('refresh', 16)} Map</button></div></div>
     <div id="st-progress"></div><div id="st-tabs"></div><div id="st-body"></div>`;
   const body = el.querySelector('#st-body');
@@ -55,7 +55,7 @@ export default function storage(el, opts) {
       el.querySelector('#st-first')?.addEventListener('click', startScan);
       return;
     }
-    el.querySelector('#st-sub').textContent = `${st.root} · ${size(st.size)} in ${int(st.files)} files · mapped in ${(st.ms / 1000).toFixed(1)}\u2009s`;
+    el.querySelector('#st-sub').textContent = `${st.root} · ${size(st.size)} in ${int(st.files)} files · mapped ${st.taken ? ago(st.taken) + ' ' : ''}in ${(st.ms / 1000).toFixed(1)}\u2009s`;
     el.querySelector('#st-tabs').innerHTML = tabs([['map', 'Map'], ['large', 'Large & old'], ['dups', 'Duplicates'], ['projects', 'Project folders'], ['downloads', 'Downloads']], S.tab);
     el.querySelectorAll('.tab').forEach((t) => (t.onclick = () => { S.tab = t.dataset.tab; render(); }));
     burst?.destroy(); burst = null;
@@ -83,7 +83,7 @@ export default function storage(el, opts) {
           <td><div class="row" style="gap:10px"><span class="swatch" style="background:${dot}"></span>${icon(c.file ? 'file' : 'folder', 16)}<span class="name" style="font-weight:${c.other ? 400 : 600}">${esc(c.name)}</span></div></td>
           <td class="num">${size(c.size)}${c.files != null ? `<div class="caption">${int(c.files)} files</div>` : ''}</td><td>${bar(c.size, max)}</td>
           <td class="act">${c.other ? '' : `<button class="btn subtle small" data-reveal="${esc(p)}" title="Show in File Explorer">${icon('open', 14)}</button>`}
-            ${c.file ? `<button class="btn small ${review.has(p) ? 'keep' : ''}" data-rev="${esc(p)}" data-size="${c.size}">${review.has(p) ? 'Marked' : 'Review'}</button>` : ''}</td></tr>`;
+            ${c.file ? `<button class="btn small ${review.has(p) ? 'keep' : ''}" data-rev="${esc(p)}" data-size="${c.size}">${review.has(p) ? 'On shortlist' : 'Shortlist'}</button>` : ''}</td></tr>`;
       }).join('')}</tbody></table></div></div></div>`;
     burst = new Sunburst(body.querySelector('#map'), {
       onZoom: (id) => { S.focus = id; renderMap(); },
@@ -104,11 +104,11 @@ export default function storage(el, opts) {
       review.toggle(p, +b.dataset.size, base(p), b.dataset.kind || 'file');
       const on = review.has(p);
       if (b.type === 'checkbox') b.checked = on;
-      else { b.textContent = on ? 'Marked' : 'Review'; b.classList.toggle('keep', on); }
+      else { b.textContent = on ? 'On shortlist' : 'Shortlist'; b.classList.toggle('keep', on); }
     }));
   }
 
-  const fileRow = (f, extra = '') => `<tr><td><input type="checkbox" data-rev="${esc(f.path)}" data-size="${f.size}" ${review.has(f.path) ? 'checked' : ''} title="Mark for review"></td>
+  const fileRow = (f, extra = '') => `<tr><td><input type="checkbox" data-rev="${esc(f.path)}" data-size="${f.size}" ${review.has(f.path) ? 'checked' : ''} title="Add to shortlist"></td>
     <td><div class="name">${esc(base(f.path))}${f.repo ? ' <span class="pill" style="font-weight:400">In a git repo</span>' : ''}</div><div class="path">${esc(parent(f.path))}</div></td>
     <td class="num">${size(f.size)}</td><td class="num muted">${extra}</td>
     <td class="act"><button class="btn subtle small" data-reveal="${esc(f.path)}" title="Show in File Explorer">${icon('open', 14)}</button></td></tr>`;
@@ -151,7 +151,7 @@ export default function storage(el, opts) {
     body.innerHTML = g.length === 0 ? `<div class="card empty"><h2>No duplicates over 1\u2009MB</h2><p>Every large file in your user folder is unique.</p></div>` :
       `<div class="infobar"><div class="grow"><b>${size(waste)}</b> is taken by extra copies in ${int(g.length)} groups. The oldest copy in each group is treated as the original.
         Copies inside a git repository are never marked automatically, because code and results there may depend on them.</div>
-        <button class="btn" id="dp-auto">Mark extra copies for review</button></div>
+        <button class="btn" id="dp-auto">Shortlist the extra copies</button></div>
       ${g.slice(0, 300).map((grp, gi) => {
         const rowsHtml = (list, off) => list.map((f, j) => { const i = j + off; return `<tr><td style="width:36px"><input type="checkbox" data-g="${gi}" data-dup="${esc(f.path)}" data-size="${f.size}" ${review.has(f.path) ? 'checked' : ''}></td>
           <td><div class="path" style="font-size:13px;color:var(--text)">${esc(f.path)}</div></td>
@@ -189,7 +189,7 @@ export default function storage(el, opts) {
     const kinds = {};
     for (const x of a) kinds[x.kind] = (kinds[x.kind] || 0) + x.size;
     body.innerHTML = `<div class="infobar"><div class="grow"><b>${size(total)}</b> in ${int(a.length)} dependency and build folders inside your projects.
-      These are rebuilt by <span class="mono">npm install</span>, <span class="mono">pip install -r requirements.txt</span> or a build, so old ones are usually safe to review.</div></div>
+      These are rebuilt by <span class="mono">npm install</span>, <span class="mono">pip install -r requirements.txt</span> or a build, so old ones are usually safe to clear out yourself.</div></div>
       <div class="chips" style="margin-bottom:12px">${Object.entries(kinds).sort((x, y) => y[1] - x[1]).map(([k, s]) => `<span class="chip">${esc(k)} <span class="n">${size(s)}</span></span>`).join('')}</div>
       <div class="card scroll-box" style="max-height:640px"><table class="tbl"><thead><tr><th></th><th>Project</th><th>Kind</th><th class="num">Size</th><th class="num">Project last changed</th><th></th></tr></thead><tbody>
       ${a.slice(0, 500).map((x) => `<tr><td><input type="checkbox" data-rev="${esc(x.path)}" data-size="${x.size}" data-kind="folder" ${review.has(x.path) ? 'checked' : ''}></td>
@@ -223,14 +223,12 @@ export default function storage(el, opts) {
     wireRowActions(body);
   }
 
-  const onRecycled = () => { forget('downloads'); S.dups = null; render(); };
-  window.addEventListener('soundings:recycled', onRecycled);
-  window.addEventListener('soundings:restored', onRecycled);
+  const onChanged = () => { forget('downloads'); S.dups = null; render(); };
+  window.addEventListener('soundings:changed', onChanged);
   render();
   return () => {
     burst?.destroy();
     unsub.forEach((p) => p.then((f) => f()));
-    window.removeEventListener('soundings:recycled', onRecycled);
-    window.removeEventListener('soundings:restored', onRecycled);
+    window.removeEventListener('soundings:changed', onChanged);
   };
 }

@@ -3,15 +3,67 @@
 
 use crate::util::{ft_to_unix, home};
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+/// One directory entry, straight from the Windows directory listing (no extra calls per file).
+struct Ent {
+    name: String,
+    dir: bool,
+    size: u64,
+    mtime: u64,
+    atime: u64,
+    ctime: u64,
+}
+
+/// Lists a directory with FindFirstFileExW in "basic" mode with large fetches: no 8.3 short names,
+/// bigger batches from the file system, sizes and dates included. Symlinks and junctions are left out
+/// (never followed); other reparse points such as OneDrive placeholders are kept.
+fn list_dir(path: &Path) -> Option<Vec<Ent>> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::*;
+    let s = path.as_os_str().to_string_lossy();
+    let mut pat = if s.starts_with(r"\\") { s.to_string() } else { format!(r"\\?\{s}") };
+    if !pat.ends_with('\\') { pat.push('\\'); }
+    pat.push('*');
+    let wide: Vec<u16> = std::ffi::OsStr::new(&pat).encode_wide().chain(Some(0)).collect();
+    let mut d: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+    let h = unsafe {
+        FindFirstFileExW(wide.as_ptr(), FindExInfoBasic, &mut d as *mut _ as *mut _, FindExSearchNameMatch,
+                         std::ptr::null(), FIND_FIRST_EX_LARGE_FETCH)
+    };
+    if h == INVALID_HANDLE_VALUE { return None; }
+    let mut out = Vec::new();
+    loop {
+        let len = d.cFileName.iter().position(|&c| c == 0).unwrap_or(d.cFileName.len());
+        let n = &d.cFileName[..len];
+        let dot = n == [46] || n == [46, 46];
+        // IO_REPARSE_TAG name-surrogate bit: symlinks and mount points / junctions
+        let link = d.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && d.dwReserved0 & 0x2000_0000 != 0;
+        if !dot && !link {
+            let ft = |f: windows_sys::Win32::Foundation::FILETIME| ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64;
+            out.push(Ent {
+                name: std::ffi::OsString::from_wide(n).to_string_lossy().into_owned(),
+                dir: d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+                size: ((d.nFileSizeHigh as u64) << 32) | d.nFileSizeLow as u64,
+                mtime: ft(d.ftLastWriteTime),
+                atime: ft(d.ftLastAccessTime),
+                ctime: ft(d.ftCreationTime),
+            });
+        }
+        if unsafe { FindNextFileW(h, &mut d) } == 0 { break; }
+    }
+    unsafe { FindClose(h) };
+    Some(out)
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct Node {
     pub name: Box<str>,
     pub parent: u32,
@@ -21,7 +73,7 @@ pub struct Node {
     pub top_files: Vec<(Box<str>, u64)>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct FileRec {
     pub path: String,
     pub size: u64,
@@ -32,7 +84,7 @@ pub struct FileRec {
     pub repo: bool,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Artifact {
     pub path: String,
     pub kind: String,
@@ -41,6 +93,7 @@ pub struct Artifact {
     pub modified: i64,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct ScanResult {
     pub root: String,
     pub nodes: Vec<Node>,
@@ -48,6 +101,32 @@ pub struct ScanResult {
     pub artifacts: Vec<Artifact>,
     pub denied: u64,
     pub elapsed_ms: u128,
+    /// When the scan finished (unix seconds).
+    pub taken: i64,
+}
+
+const SAVED_VERSION: u32 = 1;
+fn saved_path() -> PathBuf { crate::util::data_dir().join("cache").join("scan.bin") }
+
+impl ScanResult {
+    /// Keep the last map on this PC so the app opens with it instantly. Local only, never uploaded.
+    pub fn save(&self) {
+        let p = saved_path();
+        let _ = fs::create_dir_all(p.parent().unwrap());
+        let tmp = p.with_extension("tmp");
+        if let Ok(f) = fs::File::create(&tmp) {
+            let mut w = std::io::BufWriter::new(f);
+            if bincode::serialize_into(&mut w, &(SAVED_VERSION, self)).is_ok() {
+                drop(w);
+                let _ = fs::rename(&tmp, &p);
+            }
+        }
+    }
+    pub fn load_saved() -> Option<ScanResult> {
+        let f = fs::File::open(saved_path()).ok()?;
+        let (v, s): (u32, ScanResult) = bincode::deserialize_from(std::io::BufReader::new(f)).ok()?;
+        (v == SAVED_VERSION).then_some(s)
+    }
 }
 
 pub struct Progress {
@@ -93,43 +172,39 @@ const ARTIFACT_DIRS: &[(&str, &str)] = &[
 fn walk(path: &Path, name: Box<str>, ctx: &Ctx, in_artifact: bool, in_repo: bool) -> Tmp {
     let mut t = Tmp { name, size: 0, files: 0, children: vec![], top_files: vec![] };
     ctx.prog.dirs.fetch_add(1, Ordering::Relaxed);
-    let rd: Vec<fs::DirEntry> = match fs::read_dir(path) {
-        Ok(r) => r.flatten().collect(),
-        Err(_) => {
-            ctx.prog.denied.fetch_add(1, Ordering::Relaxed);
-            return t;
-        }
+    let Some(rd) = list_dir(path) else {
+        ctx.prog.denied.fetch_add(1, Ordering::Relaxed);
+        return t;
     };
-    let in_repo = in_repo || rd.iter().any(|e| e.file_name() == ".git");
+    let in_repo = in_repo || rd.iter().any(|e| e.name == ".git");
     let lower = path.to_string_lossy().to_lowercase();
     let lower = if lower.ends_with('\\') { lower } else { format!("{lower}\\") };
     let in_user = lower.starts_with(&ctx.user_root) && !lower.starts_with(&ctx.user_skip);
     let mut subdirs: Vec<(PathBuf, Box<str>)> = vec![];
     let mut my_files: Vec<FileRec> = vec![];
     for e in rd {
-        let Ok(ft) = e.file_type() else { continue };
-        if ft.is_symlink() { continue; } // junctions + symlinks: never follow
-        let fname = e.file_name().to_string_lossy().to_string();
-        if ft.is_dir() {
-            let child_lower = format!("{lower}{}", fname.to_lowercase());
-            if ctx.excluded.iter().any(|x| *x == child_lower) { continue; }
-            subdirs.push((e.path(), fname.into_boxed_str()));
-        } else if let Ok(md) = e.metadata() {
-            let sz = md.file_size();
+        if e.dir {
+            if !ctx.excluded.is_empty() {
+                let child_lower = format!("{lower}{}", e.name.to_lowercase());
+                if ctx.excluded.iter().any(|x| *x == child_lower) { continue; }
+            }
+            subdirs.push((path.join(&e.name), e.name.into_boxed_str()));
+        } else {
+            let sz = e.size;
             t.size += sz;
             t.files += 1;
             if sz >= 1 << 20 {
-                t.top_files.push((fname.clone().into_boxed_str(), sz));
                 if in_user && !in_artifact {
                     my_files.push(FileRec {
-                        path: e.path().to_string_lossy().to_string(),
+                        path: path.join(&e.name).to_string_lossy().into_owned(),
                         size: sz,
-                        modified: ft_to_unix(md.last_write_time()),
-                        accessed: ft_to_unix(md.last_access_time()),
-                        created: ft_to_unix(md.creation_time()),
+                        modified: ft_to_unix(e.mtime),
+                        accessed: ft_to_unix(e.atime),
+                        created: ft_to_unix(e.ctime),
                         repo: in_repo,
                     });
                 }
+                t.top_files.push((e.name.into_boxed_str(), sz));
             }
         }
     }
@@ -219,10 +294,23 @@ pub fn scan(root: &str, excluded: &[String], prog: &Progress) -> ScanResult {
         artifacts: ctx.artifacts_out.into_inner().unwrap(),
         denied: prog.denied.load(Ordering::Relaxed),
         elapsed_ms: start.elapsed().as_millis(),
+        taken: crate::util::now_unix(),
     }
 }
 
 impl ScanResult {
+    /// Node id for a full folder path inside the map (case-insensitive).
+    pub fn find(&self, path: &str) -> Option<u32> {
+        let root = self.root.trim_end_matches('\\').to_lowercase();
+        let want = path.trim().trim_end_matches('\\').replace('/', "\\").to_lowercase();
+        let rest = want.strip_prefix(&root)?;
+        let mut cur = 0u32;
+        for part in rest.split('\\').filter(|p| !p.is_empty()) {
+            cur = *self.nodes[cur as usize].children.iter().find(|&&c| self.nodes[c as usize].name.to_lowercase() == part)?;
+        }
+        Some(cur)
+    }
+
     pub fn path_of(&self, id: u32) -> String {
         let mut parts = vec![];
         let mut cur = id;
@@ -337,16 +425,19 @@ fn group_by<'a>(items: &[&'a FileRec], key: impl Fn(&FileRec) -> Option<[u8; 32]
 
 fn hash_file(path: &str, limit: Option<usize>) -> Option<[u8; 32]> {
     use std::io::Read;
+    thread_local! { static BUF: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0u8; 1 << 20]); }
     let mut f = fs::File::open(path).ok()?;
     let mut h = blake3::Hasher::new();
-    let mut buf = vec![0u8; 1 << 20];
-    let mut left = limit.unwrap_or(usize::MAX);
-    while left > 0 {
-        let want = buf.len().min(left);
-        let n = f.read(&mut buf[..want]).ok()?;
-        if n == 0 { break; }
-        h.update(&buf[..n]);
-        left -= n;
-    }
-    Some(*h.finalize().as_bytes())
+    BUF.with(|b| {
+        let buf = &mut b.borrow_mut()[..];
+        let mut left = limit.unwrap_or(usize::MAX);
+        while left > 0 {
+            let want = buf.len().min(left);
+            let n = f.read(&mut buf[..want]).ok()?;
+            if n == 0 { break; }
+            h.update(&buf[..n]);
+            left -= n;
+        }
+        Some(*h.finalize().as_bytes())
+    })
 }

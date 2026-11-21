@@ -4,6 +4,7 @@ mod apps;
 mod dev;
 mod downloads;
 mod games;
+mod mcp;
 mod scan;
 mod stability;
 mod system;
@@ -12,7 +13,6 @@ mod util;
 
 use scan::{FileRec, Progress, ScanResult};
 use serde_json::{json, Value};
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, State};
@@ -23,8 +23,7 @@ struct Inner {
     scanning: AtomicBool,
     dups: Mutex<Option<Value>>,
     dup_progress: AtomicU64,
-    /// Only paths the app itself has shown may be sent to the Recycle Bin.
-    allowed: Mutex<HashSet<String>>,
+    tried_saved: AtomicBool,
     telemetry: telemetry::Telemetry,
 }
 #[derive(Default, Clone)]
@@ -58,11 +57,6 @@ fn disk_cached(name: &str, max_age: u64, fresh: bool, f: impl FnOnce() -> Value)
     let v = f();
     let _ = std::fs::write(&p, v.to_string());
     v
-}
-
-fn allow<'a>(st: &AppState, paths: impl IntoIterator<Item = &'a str>) {
-    let mut a = st.0.allowed.lock().unwrap();
-    for p in paths { a.insert(p.to_lowercase()); }
 }
 
 // ---------------- settings ----------------
@@ -112,44 +106,71 @@ fn start_scan(app: tauri::AppHandle, st: State<'_, AppState>, root: String) -> R
         let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
         let res = pool.install(|| scan::scan(&root, &excluded, &prog));
         done.store(true, Ordering::Relaxed);
-        {
-            let mut a = st.0.allowed.lock().unwrap();
-            for f in &res.user_files { a.insert(f.path.to_lowercase()); }
-            for x in &res.artifacts { a.insert(x.path.to_lowercase()); }
-        }
         let summary = json!({"root": res.root, "files": res.nodes[0].files, "size": res.nodes[0].size,
                              "dirs": res.nodes.len(), "denied": res.denied, "ms": res.elapsed_ms as u64});
-        *st.0.scan.lock().unwrap() = Some(Arc::new(res));
+        let res = Arc::new(res);
+        *st.0.scan.lock().unwrap() = Some(res.clone());
         *st.0.dups.lock().unwrap() = None;
         st.0.scanning.store(false, Ordering::SeqCst);
         let _ = app.emit("scan-done", summary);
+        // keep it for next launch (in the background, after the UI already has it)
+        let _ = std::fs::remove_file(dups_path());
+        res.save();
     });
     Ok(json!({"started": true}))
 }
 
+/// The last map: in memory, or loaded once from %LOCALAPPDATA%\Soundings\cache\scan.bin.
+fn ensure_loaded(st: &AppState) -> Option<Arc<ScanResult>> {
+    if let Some(s) = st.0.scan.lock().unwrap().clone() { return Some(s); }
+    if st.0.scanning.load(Ordering::SeqCst) || st.0.tried_saved.swap(true, Ordering::SeqCst) { return None; }
+    let s = Arc::new(ScanResult::load_saved()?);
+    let mut slot = st.0.scan.lock().unwrap();
+    if slot.is_none() { *slot = Some(s.clone()); }
+    slot.clone()
+}
+
 #[tauri::command]
-fn scan_status(st: State<'_, AppState>) -> Value {
-    let s = st.0.scan.lock().unwrap();
-    json!({"scanning": st.0.scanning.load(Ordering::SeqCst), "has": s.is_some(),
+async fn scan_status(st: State<'_, AppState>) -> R {
+    let st = st.inner().clone();
+    let s = tauri::async_runtime::spawn_blocking({ let st = st.clone(); move || ensure_loaded(&st) }).await.map_err(|e| e.to_string())?;
+    Ok(json!({"scanning": st.0.scanning.load(Ordering::SeqCst), "has": s.is_some(),
            "root": s.as_ref().map(|r| r.root.clone()), "size": s.as_ref().map(|r| r.nodes[0].size),
-           "files": s.as_ref().map(|r| r.nodes[0].files), "ms": s.as_ref().map(|r| r.elapsed_ms as u64)})
+           "files": s.as_ref().map(|r| r.nodes[0].files), "ms": s.as_ref().map(|r| r.elapsed_ms as u64),
+           "taken": s.as_ref().map(|r| r.taken)}))
 }
 
 fn current(st: &AppState) -> Result<Arc<ScanResult>, String> {
-    st.0.scan.lock().unwrap().clone().ok_or_else(|| "No scan yet".to_string())
+    ensure_loaded(st).ok_or_else(|| "No scan yet".to_string())
+}
+
+fn dups_path() -> std::path::PathBuf { util::data_dir().join("cache").join("dups.json") }
+
+/// Saved duplicate groups for this exact scan, with files you've since removed left out.
+fn saved_dups(taken: i64) -> Option<Value> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(dups_path()).ok()?).ok()?;
+    (v["taken"].as_i64() == Some(taken)).then(|| prune_dups(v))
+}
+
+fn prune_dups(mut v: Value) -> Value {
+    if let Some(gs) = v["groups"].as_array_mut() {
+        for g in gs.iter_mut() {
+            if let Some(fs) = g["files"].as_array_mut() {
+                fs.retain(|f| f["path"].as_str().map(|p| std::path::Path::new(p).exists()).unwrap_or(false));
+                let (n, size) = (fs.len() as u64, g["size"].as_u64().unwrap_or(0));
+                g["wasted"] = json!(size * n.saturating_sub(1));
+            }
+        }
+        gs.retain(|g| g["files"].as_array().map(|f| f.len() > 1).unwrap_or(false));
+    }
+    v
 }
 
 #[tauri::command]
 fn tree(st: State<'_, AppState>, id: Option<u32>, depth: Option<u32>) -> R {
     let s = current(&st)?;
     let id = id.unwrap_or(0).min(s.nodes.len() as u32 - 1);
-    let v = s.view(id, depth.unwrap_or(5));
-    let base = s.path_of(id);
-    let files: Vec<String> = v["root"]["children"].as_array().map(|c| c.iter()
-        .filter(|x| x["file"].as_bool().unwrap_or(false))
-        .map(|x| format!("{}\\{}", base.trim_end_matches('\\'), x["name"].as_str().unwrap_or(""))).collect()).unwrap_or_default();
-    allow(&st, files.iter().map(|s| s.as_str()));
-    Ok(v)
+    Ok(s.view(id, depth.unwrap_or(5)))
 }
 
 #[tauri::command]
@@ -174,9 +195,17 @@ fn large_old(st: State<'_, AppState>, min_mb: u64, old_days: u64) -> R {
 
 #[tauri::command]
 async fn duplicates(app: tauri::AppHandle, st: State<'_, AppState>) -> R {
-    if let Some(d) = st.0.dups.lock().unwrap().clone() { return Ok(d); }
+    let mem = st.0.dups.lock().unwrap().clone();
+    if let Some(d) = mem {
+        return blocking(move || prune_dups(d)).await;
+    }
     let s = current(&st)?;
     let st2 = st.inner().clone();
+    let taken = s.taken;
+    if let Ok(Some(d)) = tauri::async_runtime::spawn_blocking(move || saved_dups(taken)).await {
+        *st.0.dups.lock().unwrap() = Some(d.clone());
+        return Ok(d);
+    }
     blocking(move || {
         st2.0.dup_progress.store(0, Ordering::Relaxed);
         let done = Arc::new(AtomicBool::new(false));
@@ -190,7 +219,8 @@ async fn duplicates(app: tauri::AppHandle, st: State<'_, AppState>) -> R {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
         let groups = pool.install(|| scan::duplicates(&s.user_files, &st2.0.dup_progress));
         done.store(true, Ordering::Relaxed);
-        let v = json!({"groups": groups});
+        let v = json!({"groups": groups, "taken": taken});
+        let _ = std::fs::write(dups_path(), v.to_string());
         *st2.0.dups.lock().unwrap() = Some(v.clone());
         v
     }).await
@@ -205,52 +235,16 @@ fn artifacts(st: State<'_, AppState>) -> R {
 }
 
 #[tauri::command]
-async fn downloads_insights(st: State<'_, AppState>) -> R {
-    let v = blocking(downloads::insights).await?;
-    if let Some(r) = v["recent"].as_array() {
-        allow(&st, r.iter().filter_map(|x| x["path"].as_str()));
-    }
-    Ok(v)
-}
+async fn downloads_insights() -> R { blocking(downloads::insights).await }
 
 // ---------------- actions ----------------
-#[tauri::command]
-fn recycle(st: State<'_, AppState>, paths: Vec<String>) -> R {
-    let allowed = st.0.allowed.lock().unwrap().clone();
-    let mut ok = vec![];
-    let mut failed = vec![];
-    for p in paths {
-        let low = p.to_lowercase();
-        let pb = std::path::PathBuf::from(&p);
-        // safety: only items this app listed, never a drive root or a Windows / Program Files path
-        let blocked = low.len() < 8 || low.starts_with("c:\\windows") || low.starts_with("c:\\program files") || !pb.exists();
-        if !allowed.contains(&low) || blocked {
-            failed.push(json!({"path": p, "error": "Not allowed"}));
-            continue;
-        }
-        match trash::delete(&pb) {
-            Ok(_) => ok.push(p),
-            Err(e) => failed.push(json!({"path": p, "error": e.to_string()})),
-        }
-    }
-    if !ok.is_empty() {
-        *st.0.dups.lock().unwrap() = None;
-    }
-    Ok(json!({"recycled": ok, "failed": failed}))
-}
+// Soundings has no delete, recycle or move command at all. The only action on a file is showing it
+// in File Explorer, where the user decides what to do with it.
 
+/// Which of these paths no longer exist (so the shortlist can drop items the user removed).
 #[tauri::command]
-fn undo_recycle(paths: Vec<String>) -> R {
-    use trash::os_limited;
-    let want: HashSet<String> = paths.iter().map(|p| p.to_lowercase()).collect();
-    let items = os_limited::list().map_err(|e| e.to_string())?;
-    let mine: Vec<_> = items.into_iter().filter(|i| {
-        let full = i.original_parent.join(&i.name).to_string_lossy().to_lowercase();
-        want.contains(&full)
-    }).collect();
-    let n = mine.len();
-    os_limited::restore_all(mine).map_err(|e| e.to_string())?;
-    Ok(json!({"restored": n}))
+fn missing_paths(paths: Vec<String>) -> Value {
+    json!(paths.into_iter().filter(|p| !std::path::Path::new(p).exists()).collect::<Vec<_>>())
 }
 
 #[tauri::command]
@@ -295,6 +289,46 @@ fn telemetry_status(st: State<'_, AppState>) -> Value { st.0.telemetry.status() 
 #[tauri::command]
 async fn monitor_enable(on: bool) -> R {
     tauri::async_runtime::spawn_blocking(move || stability::monitor_enable(on)).await.map_err(|e| e.to_string())?
+}
+
+// ---------------- Claude connection (read-only MCP server, off by default) ----------------
+fn claude_desktop_configs() -> Vec<std::path::PathBuf> {
+    let mut v = vec![];
+    if let Some(a) = std::env::var_os("APPDATA") { v.push(std::path::PathBuf::from(a).join("Claude")); }
+    // Microsoft Store / MSIX installs keep it in the package's virtualised AppData
+    if let Some(l) = std::env::var_os("LOCALAPPDATA") {
+        for p in util::glob(&format!("{}\\Packages\\Claude_*\\LocalCache\\Roaming\\Claude", l.to_string_lossy())) { v.push(p); }
+    }
+    v.into_iter().filter(|d| d.is_dir()).map(|d| d.join("claude_desktop_config.json")).collect()
+}
+
+#[tauri::command]
+fn claude_info() -> Value {
+    let exe = std::env::current_exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+    let cfgs = claude_desktop_configs();
+    let connected = cfgs.iter().any(|p| std::fs::read_to_string(p).ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok()).map(|v| v["mcpServers"]["soundings"].is_object()).unwrap_or(false));
+    json!({"enabled": load_settings()["claude"].as_bool().unwrap_or(false), "exe": exe,
+           "desktopFound": !cfgs.is_empty(), "desktopConnected": connected})
+}
+
+/// Adds (or removes) Soundings in Claude Desktop's own config file, keeping a backup of it first.
+#[tauri::command]
+fn claude_desktop_connect(on: bool) -> R {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?.to_string_lossy().to_string();
+    let cfgs = claude_desktop_configs();
+    if cfgs.is_empty() { return Err("Claude Desktop doesn't seem to be installed.".into()); }
+    for p in cfgs {
+        let text = std::fs::read_to_string(&p).unwrap_or_else(|_| "{}".into());
+        let mut v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|_| format!("Couldn't read {} (it isn't valid JSON), so it was left alone.", p.display()))?;
+        if p.exists() { let _ = std::fs::write(p.with_extension("json.before-soundings"), &text); }
+        if !v.is_object() { v = json!({}); }
+        if !v["mcpServers"].is_object() { v["mcpServers"] = json!({}); }
+        let servers = v["mcpServers"].as_object_mut().unwrap();
+        if on { servers.insert("soundings".into(), json!({"command": exe, "args": ["--mcp"]})); } else { servers.remove("soundings"); }
+        std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap()).map_err(|e| e.to_string())?;
+    }
+    Ok(claude_info())
 }
 
 /// Developer aid: `soundings.exe --dump <out-dir> [scan-root]` writes read-only JSON snapshots
@@ -351,6 +385,24 @@ fn main() {
         return;
     }
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--mcp") {
+        mcp::serve();
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--bench-scan") {
+        let root = args.get(i + 1).cloned().unwrap_or_else(|| "C:\\".into());
+        let excluded: Vec<String> = load_settings()["excluded"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).saturating_sub(2).clamp(2, 12);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        let s = pool.install(|| scan::scan(&root, &excluded, &Progress::new()));
+        let t = std::time::Instant::now();
+        s.save();
+        let save_ms = t.elapsed().as_millis();
+        let t = std::time::Instant::now();
+        let ok = ScanResult::load_saved().is_some();
+        println!("scan {} files, {} dirs in {} ms; save {} ms; load {} ms (ok={ok})", s.nodes[0].files, s.nodes.len(), s.elapsed_ms, save_ms, t.elapsed().as_millis());
+        return;
+    }
     if let Some(i) = args.iter().position(|a| a == "--dump") {
         dump(args.get(i + 1).map(String::as_str).unwrap_or("dump"), args.get(i + 2).cloned());
         return;
@@ -359,9 +411,9 @@ fn main() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             get_settings, set_settings, overview, start_scan, scan_status, tree, node_path, large_old, duplicates,
-            artifacts, downloads_insights, recycle, undo_recycle, reveal, apps_list, startup_list, app_usage, dev_runtimes,
+            artifacts, downloads_insights, missing_paths, reveal, apps_list, startup_list, app_usage, dev_runtimes,
             dev_caches, games_list, stability_history, monitor_status, monitor_enable,
-            telemetry_start, telemetry_stop, telemetry_status
+            telemetry_start, telemetry_stop, telemetry_status, claude_info, claude_desktop_connect
         ])
         .build(tauri::generate_context!())
         .expect("error while building Soundings")

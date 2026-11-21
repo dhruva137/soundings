@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "soundings": {
+      "command": "${LOCALAPPDATA}\\Soundings\\soundings.exe",
+      "args": ["--mcp"]
+    }
+  }
+}

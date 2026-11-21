@@ -1,4 +1,4 @@
-import { icon, invoke, inTauri, review, size, esc, confirmDialog, toast, base, cached } from './core.js';
+import { icon, invoke, inTauri, review, size, esc, toast, cached } from './core.js';
 import overview from './views/overview.js';
 import storage from './views/storage.js';
 import apps from './views/apps.js';
@@ -57,14 +57,28 @@ nav.addEventListener('keydown', (e) => {
   if (t && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); go(t.dataset.go); }
 });
 
-// ---- review tray ----
+// ---- shortlist: things you want to look at. Soundings never deletes; you do that in File Explorer. ----
 const trayBar = document.getElementById('tray-bar');
 function renderTray() {
   const n = review.items.size;
-  trayBar.innerHTML = n ? `<button class="btn accent" id="open-tray">${icon('tray', 16)} Review ${n} item${n > 1 ? 's' : ''} · ${size(review.total())}</button>` : '';
+  trayBar.innerHTML = n ? `<button class="btn accent" id="open-tray">${icon('tray', 16)} Shortlist · ${n} item${n > 1 ? 's' : ''} · ${size(review.total())}</button>` : '';
 }
 review.listeners.add(renderTray);
 trayBar.addEventListener('click', (e) => { if (e.target.closest('#open-tray')) openDrawer(); });
+
+// Drop items you already removed in File Explorer, and say how much space that freed.
+async function sweepShortlist(quiet) {
+  const paths = [...review.items.keys()];
+  if (!paths.length) return;
+  const gone = await invoke('missing_paths', { paths }).catch(() => []);
+  if (!gone.length) { if (!quiet) toast('Everything on your shortlist is still there.'); return; }
+  let freed = 0;
+  for (const p of gone) { freed += review.items.get(p)?.size || 0; review.items.delete(p); }
+  review.emit();
+  toast(`Nice. ${gone.length} item${gone.length > 1 ? 's are' : ' is'} gone, freeing about <b>${size(freed)}</b>.`);
+  window.dispatchEvent(new CustomEvent('soundings:changed'));
+}
+window.addEventListener('focus', () => sweepShortlist(true)); // coming back from File Explorer
 
 function openDrawer() {
   const back = document.createElement('div');
@@ -73,43 +87,28 @@ function openDrawer() {
   d.className = 'drawer';
   const draw = () => {
     const rows = [...review.items.entries()].sort((a, b) => (b[1].size || 0) - (a[1].size || 0));
-    d.innerHTML = `<header><h2>Review</h2><div class="caption">Items you marked. Moving them to the Recycle Bin can be undone from here or from the Recycle Bin itself.</div></header>
+    d.innerHTML = `<header><h2>Shortlist</h2><div class="caption">Soundings never deletes anything. Open an item in File Explorer and delete it there if you're sure; it goes to the Recycle Bin like always. Items you remove drop off this list by themselves.</div></header>
       <div class="body"><table class="tbl"><tbody>${rows.map(([p, v]) => `<tr><td><div class="name">${esc(v.label)}</div><div class="path">${esc(p)}</div></td>
-        <td class="num">${size(v.size)}</td><td class="act"><button class="btn subtle small keep" data-rm="${esc(p)}" title="Keep">${icon('close', 14)}</button></td></tr>`).join('')}</tbody></table></div>
+        <td class="num">${size(v.size)}</td><td class="act"><button class="btn small" data-show="${esc(p)}" title="Show in File Explorer">${icon('open', 14)} Show</button>
+        <button class="btn subtle small" data-rm="${esc(p)}" title="Take off the list">${icon('close', 14)}</button></td></tr>`).join('') ||
+        '<tr><td class="muted">Your shortlist is empty.</td></tr>'}</tbody></table></div>
       <footer><span class="grow" style="flex:1">${rows.length} items · <b>${size(review.total())}</b></span>
-        <button class="btn" data-clear>Clear list</button><button class="btn accent" data-go ${rows.length ? '' : 'disabled'}>Move to Recycle Bin</button></footer>`;
+        <button class="btn" data-copy ${rows.length ? '' : 'disabled'}>Copy list</button><button class="btn" data-check ${rows.length ? '' : 'disabled'}>Check again</button><button class="btn" data-clear>Clear list</button></footer>`;
   };
   draw();
   const close = () => { back.remove(); d.remove(); review.listeners.delete(draw); };
   review.listeners.add(draw);
   back.onclick = close;
   d.addEventListener('click', async (e) => {
+    const show = e.target.closest('[data-show]');
+    if (show) { invoke('reveal', { path: show.dataset.show }).catch((err) => toast(esc(String(err)), 'caution')); return; }
     const rm = e.target.closest('[data-rm]');
     if (rm) { review.remove(rm.dataset.rm); return; }
     if (e.target.closest('[data-clear]')) { review.clear(); close(); return; }
-    if (e.target.closest('[data-go]')) {
-      const paths = [...review.items.keys()];
-      const total = review.total();
-      const ok = await confirmDialog({
-        title: `Move ${paths.length} item${paths.length > 1 ? 's' : ''} to the Recycle Bin?`,
-        body: `${size(total)} will move to the Recycle Bin. Nothing is permanently deleted; you can restore everything with Undo.`,
-        ok: 'Move to Recycle Bin',
-      });
-      if (!ok) return;
-      const r = await invoke('recycle', { paths }).catch((err) => ({ recycled: [], failed: [{ path: '', error: String(err) }] }));
-      for (const p of r.recycled) review.remove(p);
-      close();
-      window.dispatchEvent(new CustomEvent('soundings:recycled', { detail: r.recycled }));
-      const msg = `Moved ${r.recycled.length} item${r.recycled.length === 1 ? '' : 's'} to the Recycle Bin` +
-        (r.failed.length ? ` · ${r.failed.length} skipped (${esc(r.failed[0].error)})` : '');
-      toast(msg, r.failed.length ? 'caution' : 'success', r.recycled.length ? {
-        label: 'Undo',
-        run: async () => {
-          const u = await invoke('undo_recycle', { paths: r.recycled }).catch(() => ({ restored: 0 }));
-          toast(`Restored ${u.restored} item${u.restored === 1 ? '' : 's'}`);
-          window.dispatchEvent(new CustomEvent('soundings:restored'));
-        },
-      } : null);
+    if (e.target.closest('[data-check]')) { sweepShortlist(false); return; }
+    if (e.target.closest('[data-copy]')) {
+      try { await navigator.clipboard.writeText([...review.items.keys()].join('\r\n')); toast('Copied the list of paths.'); }
+      catch { toast('Could not copy to the clipboard.', 'caution'); }
     }
   });
   document.body.append(back, d);

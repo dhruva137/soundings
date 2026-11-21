@@ -30,13 +30,23 @@ fn host_of(url: &str) -> Option<String> {
     if h.is_empty() || h == "about" { None } else { Some(h) }
 }
 
+/// Source site of a download, from the tiny Zone.Identifier stream browsers attach to it.
+fn read_host(p: &str) -> Option<String> {
+    let z = fs::read_to_string(format!("{p}:Zone.Identifier")).ok()?;
+    let url = z.lines().find_map(|l| l.strip_prefix("HostUrl=")).or_else(|| z.lines().find_map(|l| l.strip_prefix("ReferrerUrl=")));
+    url.and_then(host_of)
+}
+
 pub fn insights() -> Value {
+    use rayon::prelude::*;
     let root = home().join("Downloads");
     let mut months: HashMap<String, (u64, u64)> = HashMap::new();
     let mut fams: HashMap<&str, (u64, u64)> = HashMap::new();
     let mut hosts: HashMap<String, (u64, u64)> = HashMap::new();
     let mut total = (0u64, 0u64);
     let mut recent: Vec<(i64, String, u64)> = vec![];
+    // 1. list files (cheap)
+    let mut files: Vec<(String, u64, i64, u64)> = vec![]; // path, size, created, write-time
     let mut stack = vec![root.clone()];
     while let Some(d) = stack.pop() {
         let Ok(rd) = fs::read_dir(&d) else { continue };
@@ -44,27 +54,29 @@ pub fn insights() -> Value {
             let Ok(ft) = e.file_type() else { continue };
             if ft.is_symlink() { continue; }
             if ft.is_dir() { stack.push(e.path()); continue; }
+            if e.file_name().to_string_lossy().eq_ignore_ascii_case("desktop.ini") { continue; }
             let Ok(md) = e.metadata() else { continue };
-            let p: PathBuf = e.path();
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.eq_ignore_ascii_case("desktop.ini") { continue; }
-            let size = md.file_size();
-            let created = ft_to_unix(md.creation_time());
-            let ext = p.extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
-            let m = month_of(created);
-            let a = months.entry(m).or_default(); a.0 += 1; a.1 += size;
-            let f = fams.entry(family(&ext)).or_default(); f.0 += 1; f.1 += size;
-            total.0 += 1; total.1 += size;
-            // Zone.Identifier is a tiny alternate data stream written by browsers
-            let zone = format!("{}:Zone.Identifier", p.display());
-            if let Ok(z) = fs::read_to_string(&zone) {
-                let url = z.lines().find_map(|l| l.strip_prefix("HostUrl=")).or_else(|| z.lines().find_map(|l| l.strip_prefix("ReferrerUrl=")));
-                if let Some(h) = url.and_then(host_of) {
-                    let x = hosts.entry(h).or_default(); x.0 += 1; x.1 += size;
-                }
-            }
-            recent.push((created, p.to_string_lossy().to_string(), size));
+            files.push((e.path().to_string_lossy().into_owned(), md.file_size(), ft_to_unix(md.creation_time()), md.last_write_time()));
         }
+    }
+    // 2. source sites: remembered per file, so only new or changed files are opened
+    let cache_p = crate::util::data_dir().join("cache").join("download-sources.json");
+    let old: HashMap<String, (u64, Option<String>)> = fs::read_to_string(&cache_p).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    let srcs: Vec<Option<String>> = files.par_iter().map(|(p, _, _, w)| match old.get(p) {
+        Some((ow, h)) if ow == w => h.clone(),
+        _ => read_host(p),
+    }).collect();
+    let new: HashMap<&String, (u64, &Option<String>)> = files.iter().zip(&srcs).map(|((p, _, _, w), h)| (p, (*w, h))).collect();
+    let _ = fs::create_dir_all(cache_p.parent().unwrap());
+    let _ = fs::write(&cache_p, serde_json::to_string(&new).unwrap_or_default());
+    // 3. tally
+    for ((p, size, created, _), host) in files.into_iter().zip(srcs) {
+        let ext = PathBuf::from(&p).extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let a = months.entry(month_of(created)).or_default(); a.0 += 1; a.1 += size;
+        let f = fams.entry(family(&ext)).or_default(); f.0 += 1; f.1 += size;
+        total.0 += 1; total.1 += size;
+        if let Some(h) = host { let x = hosts.entry(h).or_default(); x.0 += 1; x.1 += size; }
+        recent.push((created, p, size));
     }
     let mut months: Vec<Value> = months.into_iter().map(|(k, (n, b))| json!({"month": k, "count": n, "bytes": b})).collect();
     months.sort_by(|a, b| a["month"].as_str().cmp(&b["month"].as_str()));

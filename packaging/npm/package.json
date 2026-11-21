@@ -1,0 +1,13 @@
+{
+  "name": "soundings-app",
+  "version": "0.2.0",
+  "description": "Install and run Soundings, a read-only Windows PC insight app (disk map, duplicates, apps, games, dev tools, crash history), and connect it to Claude.",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/dhruva137/soundings.git" },
+  "homepage": "https://github.com/dhruva137/soundings",
+  "keywords": ["windows", "disk-usage", "duplicates", "storage", "mcp", "claude", "system-info"],
+  "bin": { "soundings-app": "cli.js" },
+  "files": ["cli.js", "README.md"],
+  "os": ["win32"],
+  "engines": { "node": ">=18" }
+}

@@ -1,8 +1,7 @@
 name: Release
 
+# Run by hand (Actions > Release > Run workflow) to build the installer on GitHub as a draft release.
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
 
 permissions:

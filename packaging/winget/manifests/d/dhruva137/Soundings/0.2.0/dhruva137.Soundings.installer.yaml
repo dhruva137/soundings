@@ -1,0 +1,15 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+PackageIdentifier: dhruva137.Soundings
+PackageVersion: 0.2.0
+InstallerType: nullsoft
+Scope: user
+InstallModes:
+  - interactive
+  - silent
+UpgradeBehavior: install
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/dhruva137/soundings/releases/download/v0.2.0/Soundings_0.2.0_x64-setup.exe
+    InstallerSha256: 53F88355912817D020E99A5BB5807613589BC5F554D69DBCE7D32925092BF4D2
+ManifestType: installer
+ManifestVersion: 1.6.0

@@ -1,0 +1,25 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: dhruva137.Soundings
+PackageVersion: 0.2.0
+PackageLocale: en-US
+Publisher: dhruva137
+PublisherUrl: https://github.com/dhruva137
+PackageName: Soundings
+PackageUrl: https://github.com/dhruva137/soundings
+License: MIT
+LicenseUrl: https://github.com/dhruva137/soundings/blob/main/LICENSE
+ShortDescription: A calm, read-only look at your Windows PC.
+Description: >-
+  Soundings shows what is on your Windows PC and what has been going wrong with it: a map of the whole
+  drive, large, old and duplicate files, installed apps by origin, developer runtimes and caches, games,
+  and blue screens / GPU resets on one timeline. It never deletes anything, makes no network
+  connections, and can optionally answer questions for Claude through a read-only MCP server.
+Tags:
+  - disk-usage
+  - duplicates
+  - storage
+  - system-information
+  - mcp
+ReleaseNotesUrl: https://github.com/dhruva137/soundings/releases/tag/v0.2.0
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

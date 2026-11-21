@@ -1,0 +1,9 @@
+{
+  "name": "soundings",
+  "version": "0.2.0",
+  "description": "Read-only view of this Windows PC from the Soundings app: storage map, large/old/duplicate files, apps, app usage, developer tools and caches, games, crash history and downloads. Needs Soundings installed and Settings > Connect Claude turned on.",
+  "homepage": "https://github.com/dhruva137/soundings",
+  "repository": "https://github.com/dhruva137/soundings",
+  "license": "MIT",
+  "keywords": ["windows", "storage", "duplicates", "crashes", "mcp"]
+}

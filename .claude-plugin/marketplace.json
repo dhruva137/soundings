@@ -1,0 +1,13 @@
+{
+  "name": "soundings",
+  "owner": { "name": "Soundings", "url": "https://github.com/dhruva137/soundings" },
+  "metadata": { "description": "Read-only insight into a Windows PC for Claude." },
+  "plugins": [
+    {
+      "name": "soundings",
+      "source": "./packaging/claude-plugin",
+      "description": "Lets Claude read Soundings' view of this Windows PC: storage map, large/old/duplicate files, apps, app usage, developer tools, games and crash history. Read-only.",
+      "version": "0.2.0"
+    }
+  ]
+}
